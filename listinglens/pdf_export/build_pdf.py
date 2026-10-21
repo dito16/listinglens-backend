@@ -325,26 +325,31 @@ def render_pdf(out,fields,photos,map_file,origins,kind):
 
 
 def try_live_html(listing_id,dest):
+    """Use the same bounded SSR fetch as Collection/ID Search.
+
+    A single public detail page is requested, with only validated redirects.
+    Honor upstream denial (401/403/429): no alternate proxies, retries or bypass.
+    """
+    import asyncio
     from bs4 import BeautifulSoup
-    # Reuse the same local parser as R1; no protected API endpoint.
     import probe_r1
-    url=SOURCE_URL.format(id=listing_id)
-    ses=requests.Session()
-    with ses.get(url,timeout=(8,22),stream=True,headers={'User-Agent':MAC_UA}) as resp:
-        status=resp.status_code
-        if status in (403,429):raise PermissionError(f'HTML_ACCESS_DENIED_{status}')
-        resp.raise_for_status()
-        raw=resp.content
-        if len(raw)>6_000_000:raise ValueError('HTML_TOO_LARGE')
-        if urlparse(resp.url).hostname not in ('www.myhome.ge','myhome.ge'):raise ValueError('UNEXPECTED_HTML_HOST')
-    page=raw.decode('utf-8','replace')
+    # Executed as a script in an isolated subprocess: ensure package root is importable.
+    repository_root = str(Path(__file__).resolve().parents[2])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    from listinglens.detail import detail_url
+    from listinglens.transport import fetch_html
+
+    page,effective_url,status = asyncio.run(fetch_html(detail_url(str(listing_id)),timeout=22))
+    raw=page.encode('utf-8')
+    if len(raw)>6_000_000:raise ValueError('HTML_TOO_LARGE')
     soup=BeautifulSoup(page,'html.parser')
     scripted=' '.join((x.string or x.get_text() or '')[:2000000] for x in soup.select('script#__NEXT_DATA__'))
     if str(listing_id) not in scripted:raise ValueError('LISTING_ID_NOT_IN_NEXT_DATA')
     ev=probe_r1.Evidence()
     probe_r1.html_extract(page,ev,str(listing_id),'HTTP_HTML',dest)
     fields,summary=probe_r1.build_results(ev)
-    return {'listing_id':str(listing_id),'url':resp.url,'fields':fields},ev.rows,{'html_status':status,'html_bytes':len(raw)}
+    return {'listing_id':str(listing_id),'url':effective_url,'fields':fields},ev.rows,{'html_status':status,'html_bytes':len(raw)}
 
 
 def selftest(fixture):
@@ -455,4 +460,10 @@ def main():
 if __name__=='__main__':
     try:main()
     except Exception as ex:
-        print(f'ERROR={type(ex).__name__}: {ex}',file=sys.stderr);sys.exit(2)
+        # Public workers expose a bounded error code, never raw page data or paths.
+        known={'HTML_TOO_LARGE','LISTING_ID_NOT_IN_NEXT_DATA','UNEXPECTED_HTML_HOST'}
+        code=getattr(ex,'code',None)
+        if not isinstance(code,str) or not re.fullmatch(r'[A-Z_]{3,80}',code):
+            code=str(ex) if str(ex) in known else type(ex).__name__
+        print(f'PDF_ERROR_CODE={code}',file=sys.stderr)
+        sys.exit(2)

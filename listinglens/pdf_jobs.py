@@ -6,6 +6,7 @@ nine OpenStreetMap tiles each. Never use persisted fixtures or contact data.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix='/api/pdf', tags=['PDF Generator'])
+logger=logging.getLogger('listinglens.pdf')
 BASE = Path(__file__).resolve().parent.parent / 'data' / 'pdf_jobs'
 PDF_SCRIPT = Path(__file__).resolve().parent / 'pdf_export' / 'build_pdf.py'
 MAX_LISTINGS = 10
@@ -87,20 +89,46 @@ def _zip_outputs(job, completed):
     job['download_ready'] = True
 
 
-def _safe_error(stderr):
-    """A short public reason only; never return raw HTML, seller data or traceback."""
-    message = str(stderr or '')[-1000:].upper()
-    if 'HTTP_403' in message or 'HTTP 403' in message:
-        return 'MyHome refused this listing (HTTP 403)'
-    if 'HTTP_429' in message or 'HTTP 429' in message:
-        return 'MyHome rate limit reached (HTTP 429)'
+def _safe_error(stderr,returncode=2):
+    """Classify only public, non-sensitive error codes from the worker stderr."""
+    message=str(stderr or '')[-1400:].upper()
+    if returncode in (-9, 137):
+        return 'PDF worker was terminated (memory limit or system stop)'
+    if 'UPSTREAM_ACCESS_DENIED' in message or 'HTML_ACCESS_DENIED' in message:
+        return 'MyHome refused or rate-limited the cloud request'
+    if 'UPSTREAM_NETWORK_ERROR' in message or 'CONNECTIONERROR' in message or 'CONNECTTIMEOUT' in message:
+        return 'Network error while requesting MyHome'
     if 'LISTING_ID_NOT_IN_NEXT_DATA' in message:
         return 'Listing ID could not be verified on its page'
+    if 'UPSTREAM_DETAIL_MISSING' in message or 'UPSTREAM_INVALID_SCHEMA' in message:
+        return 'MyHome did not return expected listing data'
+    if 'UPSTREAM_REDIRECT' in message:
+        return 'MyHome redirected to an unexpected listing page'
     if 'HTML_TOO_LARGE' in message:
         return 'Listing page was too large'
-    if 'MISSING_DEPENDENCY' in message:
+    if 'MISSING_DEPENDENCY' in message or 'IMPORTERROR' in message or 'MODULENOTFOUNDERROR' in message:
         return 'PDF dependency missing from Python environment'
+    if 'LISTING_ID_MISMATCH' in message or 'UPSTREAM_LISTING_MISMATCH' in message:
+        return 'Listing identity could not be verified'
+    if 'MEMORYERROR' in message:
+        return 'Not enough memory to generate PDF'
+    if 'PERMISSIONERROR' in message:
+        return 'External media server refused a request'
+    if 'VALUEERROR' in message:
+        return 'PDF extraction encountered unexpected data'
+    if 'TYPEERROR' in message or 'KEYERROR' in message:
+        return 'PDF parser encountered unexpected data'
     return 'Live listing data or PDF generation unavailable'
+
+
+def _diag_code(stderr,returncode):
+    """Bounded Render log classifier: never log stderr or HTML."""
+    error=re.search(r'PDF_ERROR_CODE=([A-Za-z_]{3,80})',str(stderr or ''))
+    if error:
+        return error.group(1).upper()
+    if returncode in (-9,137):
+        return 'WORKER_TERMINATED'
+    return 'NO_RECOGNIZED_CODE'
 
 
 def _work(job_id):
@@ -126,7 +154,10 @@ def _work(job_id):
                 pdf = dst / f'MYHOME_{listing_id}_PDF.pdf'
                 meta = dst / 'DATA_WITH_SOURCES.json'
                 if proc.returncode or not pdf.is_file() or not meta.is_file():
-                    raise RuntimeError(_safe_error(proc.stderr))
+                    logger.warning('PDF_WORKER_FAILED id=%s rc=%s code=%s has_pdf=%s has_meta=%s',
+                                   listing_id, proc.returncode, _diag_code(proc.stderr,proc.returncode),
+                                   pdf.is_file(), meta.is_file())
+                    raise RuntimeError(_safe_error(proc.stderr,proc.returncode))
                 if not 3_000 <= pdf.stat().st_size < 35_000_000:
                     raise RuntimeError('Generated PDF size was outside expected bounds')
                 # Metadata is allowed only after validating origin listing ID.
@@ -147,8 +178,16 @@ def _work(job_id):
                          'Listing ID could not be verified on its page',
                          'Listing page was too large',
                          'PDF dependency missing from Python environment',
-                         'MyHome refused this listing (HTTP 403)',
-                         'MyHome rate limit reached (HTTP 429)'}
+                         'MyHome refused or rate-limited the cloud request',
+                         'Network error while requesting MyHome',
+                         'MyHome did not return expected listing data',
+                         'MyHome redirected to an unexpected listing page',
+                         'Listing identity could not be verified',
+                         'Not enough memory to generate PDF',
+                         'PDF worker was terminated (memory limit or system stop)',
+                         'External media server refused a request',
+                         'PDF extraction encountered unexpected data',
+                         'PDF parser encountered unexpected data'}
                 item = {'listing_id': listing_id, 'status': 'FAILED', 'reason':
                         str(exc) if str(exc) in allowed else 'Could not extract or generate a verified PDF'}
                 with LOCK:
