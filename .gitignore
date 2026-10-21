@@ -27,3 +27,17 @@ __pycache__/
 results/
 reports/
 outputs/
+
+# Additional generated outputs and local caches
+*.jsonl
+*.ndjson
+*.parquet
+*.tsv
+*.xls
+*.heic
+*.tar
+*.7z
+/screenshots/
+/downloads/
+/cache/
+/logs/
