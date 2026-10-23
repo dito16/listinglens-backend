@@ -141,8 +141,8 @@ def parse_scope(payload:dict)->tuple[str,SearchQuery,Scope]:
     if any(key in payload for key in ('owner_search_page_budget','owner_candidate_budget')):
         raise QueryIssue('UNSUPPORTED_LEGACY_MATCH_LIMIT','Legacy limits are unsupported; refresh the application')
     if os.environ.get('LISTINGLENS_PUBLIC_DEMO') == '1':
+        # Keep the restrictions already present in the public GitHub/Render version.
         # The private/local package retains its full user-controlled scope.
-        # Render Free is a shared public preview, not an unbounded collector.
         if pages_mode != 'range' or listings_mode != 'limit' or last is None or limit is None or last-first+1>5 or first>5 or limit>100:
             raise QueryIssue('PUBLIC_DEMO_SCOPE_LIMIT',
                 'Public demo: select a page range within pages 1–5 and a maximum of 100 listings.')
@@ -307,22 +307,34 @@ async def detail_source(ident:str)->dict:
     return normalize_detail(extract_detail(html,ident,url),ident)
 
 
-async def enumerate_agent_ids(q:SearchQuery, first_batch:SearchBatch, scope:Scope):
+async def _enumerate_agent_ids_flat(q:SearchQuery, first_batch:SearchBatch, scope:Scope, *, fetch=None):
     """Enumerate an actual MyHome HTML search, never an API count.
 
     The denominator is the number of distinct, locally seller-role-verified
-    owner_type=agent IDs in this *time-varying enumeration snapshot*. Two successive
-    SSR-verified RAW-empty pages are required. No hardcoded page count cap.
+    owner_type=agent IDs in this *time-varying enumeration snapshot*. The first
+    SSR-verified RAW-empty page establishes the end. No hardcoded page count cap.
     No detail pages or images are requested here.
     """
     first=1 if scope.pages_mode=='all' else scope.first
     last=scope.last if scope.pages_mode=='range' else None
     seen=set(); raw_page_fingerprints=set(); included=[]; source_rows=0
     rejected=0; role_variances=0; empty_streak=0; page=first; last_nonempty=None; pages_seen=0
+    failed_page=None
     while last is None or page<=last:
         if page != first:
             await asyncio.sleep(1.5)
-        items=first_batch if page==first else await search_source(replace(q,page=page))
+        try:
+            items=first_batch if page==first else await (fetch or search_source)(replace(q,page=page))
+        except SourceError as exc:
+            # After verified pages, a persistent MyHome HTTP 500 is not evidence
+            # of an empty/end page. Retain the verified subset, explicitly
+            # label global coverage unknown, and allow its rows to be processed.
+            # No fallback for access denial, schema errors or a failed first page.
+            if (last is None and page>first and pages_seen>0 and
+                    exc.code=='UPSTREAM_HTTP_ERROR' and str(exc)=='MyHome returned HTTP 500'):
+                failed_page=page
+                break
+            raise
         raw=getattr(items,'raw_count',len(items))
         raw_ids=tuple(getattr(items,'raw_ids',None) or [x['listing_id'] for x in items])
         if raw != len(raw_ids):
@@ -333,8 +345,8 @@ async def enumerate_agent_ids(q:SearchQuery, first_batch:SearchBatch, scope:Scop
             raise SourceError('AGENT_FILTER_NOT_EFFECTIVE',f'Page {page} contains unexpected seller roles')
         source_rows+=raw;rejected+=getattr(items,'excluded_count',0);pages_seen+=1
         if raw==0:
-            empty_streak+=1
-            if empty_streak==2:break
+            empty_streak=1
+            break
         else:
             if raw_ids in raw_page_fingerprints:
                 raise SourceError('REPEATED_SOURCE_PAGE','Source returned a repeated nonempty page; coverage is unverified')
@@ -353,24 +365,27 @@ async def enumerate_agent_ids(q:SearchQuery, first_batch:SearchBatch, scope:Scop
                 role_variances+=bool(hit.get('source_filter_warning'))
         page+=1
     if last is not None:
-        end_reason='USER_SELECTED_LAST_PAGE' if empty_streak<2 else 'TWO_EMPTY_SSR_PAGES'
+        end_reason='FIRST_EMPTY_SSR_PAGE' if empty_streak else 'USER_SELECTED_LAST_PAGE'
+    elif failed_page is not None:
+        end_reason='UPSTREAM_HTTP_500_UNVERIFIED_END'
     else:
-        if empty_streak!=2:
+        if not empty_streak:
             raise SourceError('SOURCE_END_UNVERIFIED','Could not confirm end of results')
-        end_reason='TWO_EMPTY_SSR_PAGES'
+        end_reason='FIRST_EMPTY_SSR_PAGE'
     return {'rows':included,'total':len(included),'pages_visited':pages_seen,'listing_pages':len(raw_page_fingerprints),
             'last_nonempty_page':last_nonempty,'raw_rows':source_rows,
             'excluded_rows':rejected,'agent_role_filter_variances':role_variances,
-            'end_reason':end_reason,
+            'end_reason':end_reason, 'complete':failed_page is None,
+            'failed_page':failed_page,
             'enumerated_at':clock(),'role_scope':'AGENT_ONLY' if q.owner_type=='agent' else 'AGENT_ONLY_FROM_MIXED'}
 
 
-async def enumerate_owner_ids(q: SearchQuery, first_batch: SearchBatch, scope: Scope):
+async def _enumerate_owner_ids_flat(q: SearchQuery, first_batch: SearchBatch, scope: Scope, *, fetch=None):
     """Count OWNER listings by SSR-verified, role-checked public search pages.
 
     MyHome search pages may have no `statements/count` record.  A full, finite
     enumeration is then the only locally established *snapshot* denominator.
-    Two empty RAW pages establish the end; short pages alone do not.
+    The first verified RAW-empty page ends enumeration; short pages alone do not.
     Never count duplicates, unrelated seller roles, or unvalidated cards.
     This does not scrape details/photos and never requests another endpoint.
     """
@@ -380,11 +395,20 @@ async def enumerate_owner_ids(q: SearchQuery, first_batch: SearchBatch, scope: S
     last=scope.last if scope.pages_mode=='range' else None
     seen=set(); fingerprints=set(); accepted=[]
     page=first; empties=0; pages_visited=0; listing_pages=0
-    raw_rows=0; excluded_rows=0; last_nonempty=None
+    raw_rows=0; excluded_rows=0; last_nonempty=None; failed_page=None
     while last is None or page<=last:
         if page!=first:
             await asyncio.sleep(0.6)
-        batch=first_batch if page==first else await search_source(replace(q,page=page))
+        try:
+            batch=first_batch if page==first else await (fetch or search_source)(replace(q,page=page))
+        except SourceError as exc:
+            # A source HTTP 500 is not proof of an empty page. Preserve already
+            # validated rows, without labelling the global coverage complete.
+            if (last is None and page>first and pages_visited>0 and
+                    exc.code=='UPSTREAM_HTTP_ERROR' and str(exc)=='MyHome returned HTTP 500'):
+                failed_page=page
+                break
+            raise
         raw=getattr(batch,'raw_count',len(batch))
         ids=tuple(getattr(batch,'raw_ids',None) or [x['listing_id'] for x in batch])
         if raw!=len(ids) or raw>PER_PAGE or len(set(ids))!=len(ids):
@@ -394,8 +418,8 @@ async def enumerate_owner_ids(q: SearchQuery, first_batch: SearchBatch, scope: S
         pages_visited+=1; raw_rows+=raw
         excluded_rows+=getattr(batch,'excluded_count',0)
         if not raw:
-            empties+=1
-            if empties>=2:break
+            empties=1
+            break
         else:
             if ids in fingerprints:
                 raise SourceError('REPEATED_SOURCE_PAGE',f'Page {page} repeats another nonempty page')
@@ -408,13 +432,105 @@ async def enumerate_owner_ids(q: SearchQuery, first_batch: SearchBatch, scope: S
                     raise SourceError('REPEATED_LISTING_ID',f'Listing {ident} occurs on multiple pages; exact enumeration is unverified')
                 seen.add(ident); accepted.append(hit)
         page+=1
-    if last is None and empties!=2:
-        raise SourceError('SOURCE_END_UNVERIFIED','Missing two consecutive empty pages at the end')
+    if last is None and not empties and failed_page is None:
+        raise SourceError('SOURCE_END_UNVERIFIED','Could not verify the end of owner search')
     return {'rows':accepted,'total':len(accepted),'pages_visited':pages_visited,
         'listing_pages':listing_pages,'raw_rows':raw_rows,'excluded_rows':excluded_rows,
         'last_nonempty_page':last_nonempty,
-        'end_reason':'TWO_EMPTY_SSR_PAGES' if empties==2 else 'USER_SELECTED_LAST_PAGE',
+        'end_reason':'UPSTREAM_HTTP_500_UNVERIFIED_END' if failed_page else 'FIRST_EMPTY_SSR_PAGE' if empties else 'USER_SELECTED_LAST_PAGE',
+        'complete':failed_page is None,'failed_page':failed_page,
         'role_scope':'OWNER_ONLY','enumerated_at':clock()}
+
+
+async def _enumerate_price_partitioned(q:SearchQuery, first_batch:SearchBatch, scope:Scope,
+                                       flat, *, level:int=0, fetch=None):
+    """Recover a complete all-page enumeration when MyHome fails at later pages.
+
+    If the public search responds HTTP 500 beyond page five, the broad query
+    cannot establish the end. Retry smaller *overlapping* price intervals,
+    each enumerated from page 1 to its first VERIFIED empty page. The shared
+    price boundary is scanned in both buckets and listing IDs are deduplicated.
+    No 500, repeated page, or unverified role is ever interpreted as empty.
+
+    If even the narrowest partition cannot verify its end, return PARTIAL;
+    never claim complete coverage. This does not bypass auth, 403/429, CAPTCHA,
+    or access controls; it only uses the same public HTML search route with
+    narrower user-selected price filters.
+    """
+    original=await flat(q,first_batch,scope)
+    if (original.get('complete',True) or scope.pages_mode!='all' or
+        original.get('failed_page') is None or
+        # A five-page, fully packed snapshot is evidence of a pagination
+        # boundary problem. A sparse snapshot followed by HTTP500 is more
+        # likely a transient source failure and should not trigger dozens
+        # of speculative narrower requests.
+        original.get('listing_pages',0)<5 or original.get('raw_rows',0)<5*PER_PAGE or
+        q.price_from is None or q.price_to is None or
+        q.price_to - q.price_from <= 1):
+        return original
+    low,high=q.price_from,q.price_to
+    boundary=(low+high)//2
+    # Overlap at the exact boundary; works even for fractional price amounts.
+    bounds=((low,boundary),(boundary,high))
+    children=[]
+    for lo,hi in bounds:
+        child_q=replace(q,price_from=lo,price_to=hi,page=1)
+        # The previous broad first batch is not valid evidence for either child.
+        try:
+            batch=await (fetch or search_source)(child_q)
+            child=await _enumerate_price_partitioned(child_q,batch,scope,flat,level=level+1,fetch=fetch)
+        except SourceError as exc:
+            # Respect explicit access denial immediately. Never attempt other
+            # buckets after 401/403/429.
+            if exc.code == 'UPSTREAM_ACCESS_DENIED':
+                raise
+            # Not every independent range may be available. Preserve broad
+            # already validated rows rather than turning a partial search into
+            # total failure. Explicitly retain incomplete coverage.
+            fallback=dict(original)
+            fallback['partition_error_code']=exc.code
+            fallback['partition_count']=sum(c.get('partition_count',1) for c in children)
+            fallback['end_reason']='PRICE_PARTITION_UNVERIFIED_END'
+            return fallback
+        children.append(child)
+    # Stable insertion order; broad snapshot is retained only when its rows
+    # cannot be reproduced by partitions (e.g. upstream changed while scanning).
+    seen=set(); merged=[]
+    for child in children:
+        for row in child['rows']:
+            ident=row['listing_id']
+            if ident not in seen:
+                seen.add(ident); merged.append(row)
+    missing_original=[row for row in original['rows'] if row['listing_id'] not in seen]
+    for row in missing_original:
+        seen.add(row['listing_id']); merged.append(row)
+    complete=all(c.get('complete',False) for c in children) and not missing_original
+    return {
+        'rows':merged, 'total':len(merged),
+        'pages_visited':sum(c['pages_visited'] for c in children),
+        'listing_pages':sum(c['listing_pages'] for c in children),
+        'last_nonempty_page':None,  # Multiple independent page sequences
+        'raw_rows':sum(c['raw_rows'] for c in children),
+        'excluded_rows':sum(c['excluded_rows'] for c in children),
+        'agent_role_filter_variances':sum(c.get('agent_role_filter_variances',0) for c in children),
+        'end_reason':'PRICE_PARTITIONS_FIRST_EMPTY_SSR' if complete else 'PRICE_PARTITION_UNVERIFIED_END',
+        'complete':complete,
+        'failed_page':None if complete else next((c.get('failed_page') for c in children if not c.get('complete',True)), original['failed_page']),
+        'enumerated_at':clock(),
+        'role_scope':original['role_scope'],
+        'partition_count':sum(c.get('partition_count',1) for c in children),
+        'partition_bounds':[b for i,c in enumerate(children) for b in c.get('partition_bounds',[list(bounds[i])])],
+        'partition_original_unrecovered_ids':len(missing_original),
+        'partition_strategy':'OVERLAPPING_PRICE_RANGES;EXACT_ID_DEDUP;FIRST_VERIFIED_EMPTY',
+    }
+
+
+async def enumerate_agent_ids(q:SearchQuery, first_batch:SearchBatch, scope:Scope):
+    return await _enumerate_price_partitioned(q,first_batch,scope,_enumerate_agent_ids_flat)
+
+
+async def enumerate_owner_ids(q:SearchQuery, first_batch:SearchBatch, scope:Scope):
+    return await _enumerate_price_partitioned(q,first_batch,scope,_enumerate_owner_ids_flat)
 
 
 @router.post('/preflight')
@@ -465,8 +581,15 @@ async def preflight(payload:dict):
         # in an explicit All/All selection rather than calling first-page 24 the total.
         # Reuse this frozen snapshot when Start is clicked; no duplicate search requests.
         direct_owner_count=getattr(sample,'source_count',None)
-        if mode=='OWNER' and direct_owner_count is None and scope.pages_mode=='all' and scope.listings_mode=='all':
+        if mode=='OWNER' and scope.pages_mode=='all':
+            # An SSR count does not make page 6 retrievable. Reuse the same
+            # adaptive enumeration even if MyHome publishes an approximate
+            # last_page. Respect an explicitly selected listing row limit.
             owner_snapshot=await enumerate_owner_ids(live_q,sample,scope)
+            if scope.listings_mode=='limit':
+                original_total=owner_snapshot['total']
+                owner_snapshot=dict(owner_snapshot,rows=owner_snapshot['rows'][:scope.row_limit],
+                    full_unlimited_total=original_total,applied_row_limit=scope.row_limit)
         raw=getattr(sample,'raw_count',len(sample)); excluded=getattr(sample,'excluded_count',0)
         direct_count=getattr(sample,'source_count',None)
         # AGENT exact count is impossible without proof that the agent-only filter is effective.
@@ -487,6 +610,21 @@ async def preflight(payload:dict):
             blockers.append('AGENT_FILTER_UNVERIFIED: roles will be verified per listing; agent total is unknown')
         # When source returned count, this is a provenance claim for precise filter signature ONLY.
         sample_agents=sum(r.get('owner_type')=='agent' for r in sample)
+        partial_agent_snapshot=bool(snapshot is not None and not snapshot.get('complete',True))
+        partial_owner_snapshot=bool(owner_snapshot is not None and not owner_snapshot.get('complete',True))
+        warnings=[]
+        if snapshot and snapshot.get('partition_count',1)>1 and snapshot.get('complete',False):
+            warnings.append(f"Recovered complete agent enumeration across {snapshot['partition_count']} overlapping price partitions. Total counts distinct verified IDs, not the MyHome UI counter.")
+        if owner_snapshot and owner_snapshot.get('partition_count',1)>1 and owner_snapshot.get('complete',False):
+            warnings.append(f"Recovered complete owner enumeration across {owner_snapshot['partition_count']} overlapping price partitions. Total counts distinct verified IDs, not the MyHome UI counter.")
+        if partial_agent_snapshot:
+            warnings.append(f"PARTIAL COVERAGE: MyHome returned HTTP 500 on page {snapshot['failed_page']}. "
+                            f"Only {snapshot['total']} agent listings from {snapshot['pages_visited']} verified pages are available. "
+                            "The full total is unknown; you can process this partial snapshot.")
+        if partial_owner_snapshot:
+            warnings.append(f"PARTIAL COVERAGE: MyHome returned HTTP 500 on page {owner_snapshot['failed_page']}. "
+                            f"Only {owner_snapshot['total']} owner listings from {owner_snapshot['pages_visited']} verified pages are available. "
+                            "The full total is unknown; you can process this partial snapshot.")
         token=uuid.uuid4().hex
         result={'preflight_id':token,'mode':mode,'filters':live_q.as_dict(),
            'query_url':live_q.url(),'requested_scope':{'pages_mode':scope.pages_mode,'page_from':scope.first,'page_to':scope.last,
@@ -495,25 +633,27 @@ async def preflight(payload:dict):
            'first_page_count':len(sample),'first_page_raw_count':raw,'first_page_excluded_count':excluded,
            'first_page_excluded_examples':getattr(sample,'excluded_examples',[]),
            'first_page_agent_count':sample_agents if mode=='AGENT' else None,
-           'enumerated_agent_total':snapshot['total'] if snapshot else None,
-           'enumerated_owner_total':owner_snapshot['total'] if owner_snapshot else None,
+           'enumerated_agent_total':snapshot['total'] if snapshot and not partial_agent_snapshot else None,
+           'partial_agent_rows':snapshot['total'] if partial_agent_snapshot else None,
+           'enumerated_owner_total':owner_snapshot['total'] if owner_snapshot and not partial_owner_snapshot else None,
+           'partial_owner_rows':owner_snapshot['total'] if partial_owner_snapshot else None,
            'enumeration_evidence':{k:v for k,v in (snapshot or owner_snapshot).items() if k!='rows'} if (snapshot or owner_snapshot) else None,
            'agent_role_handling':direct_filter_proof,
            'source_total':count['total'] if count else None,
            'displayed_ui_total_unverified':getattr(sample,'displayed_ui_total',None),
            'access_status':'NO_UPSTREAM_ACCESS_DENIAL_OBSERVED',
            'source_last_page':last,'source_per_page':count['per_page'] if count else PER_PAGE,
-           'source_total_status':'VERIFIED' if count else 'ENUMERATED_AGENT_SNAPSHOT' if snapshot else 'ENUMERATED_OWNER_SNAPSHOT' if owner_snapshot else 'COUNT_UNKNOWN',
-           'count_evidence':count,'count_quality':'VERIFIED' if count else 'ENUMERATED_SNAPSHOT' if (snapshot or owner_snapshot) else 'UNKNOWN',
-           'count_explanation':'Verified SSR statements/count' if count else 'Agent IDs from verified SSR pages; not an official MyHome total' if snapshot else 'Owner IDs from verified SSR pages; not an official MyHome total' if owner_snapshot else 'COUNT_UNKNOWN: SSR did not provide a verified total',
+           'source_total_status':'PARTIAL_AGENT_SNAPSHOT' if partial_agent_snapshot else 'PARTIAL_OWNER_SNAPSHOT' if partial_owner_snapshot else 'VERIFIED' if count else 'ENUMERATED_AGENT_SNAPSHOT' if snapshot else 'ENUMERATED_OWNER_SNAPSHOT' if owner_snapshot else 'COUNT_UNKNOWN',
+           'count_evidence':count,'count_quality':'PARTIAL' if (partial_agent_snapshot or partial_owner_snapshot) else 'VERIFIED' if count else 'ENUMERATED_SNAPSHOT' if (snapshot or owner_snapshot) else 'UNKNOWN',
+           'count_explanation':'Only agent IDs from verified pages; remaining pages unknown due to HTTP 500' if partial_agent_snapshot else 'Only owner IDs from verified pages; remaining pages unknown due to HTTP 500' if partial_owner_snapshot else 'Verified SSR statements/count' if count else 'Agent IDs from verified SSR pages; not an official MyHome total' if snapshot else 'Owner IDs from verified SSR pages; not an official MyHome total' if owner_snapshot else 'COUNT_UNKNOWN: SSR did not provide a verified total',
            'selected_page_from':selected[0],
            'selected_page_to':selected[1],
            'planned_max_pages':page_cap,'planned_max_rows':row_cap,
            'theoretical_listing_slots':slots,'estimated_total':available,
            'owner_matching_policy':'SINGLE_EXACT_GEO_ROOMS_BEDROOMS_PRICE_AREA;FIRST_FOUR_AGENT_IMAGES;FIRST_SIMILARITY_GT_0_95',
-           'scope_total_expected':snapshot['total'] if snapshot else owner_snapshot['total'] if owner_snapshot else min(available,scope.row_limit) if count and scope.row_limit is not None else available if count else None,
-           'scope_total_provenance':'LIVE_AGENT_SNAPSHOT_ENUMERATION' if snapshot else 'LIVE_OWNER_SNAPSHOT_ENUMERATION' if owner_snapshot else 'VERIFIED_SOURCE_COUNT' if count else 'UNKNOWN',
-           'blockers':blockers,'can_start':True,
+           'scope_total_expected':snapshot['total'] if snapshot else len(owner_snapshot['rows']) if owner_snapshot else min(available,scope.row_limit) if count and scope.row_limit is not None else available if count else None,
+           'scope_total_provenance':'PARTIAL_AGENT_SNAPSHOT' if partial_agent_snapshot else 'PARTIAL_OWNER_SNAPSHOT' if partial_owner_snapshot else 'LIVE_AGENT_SNAPSHOT_ENUMERATION' if snapshot else 'LIVE_OWNER_SNAPSHOT_ENUMERATION' if owner_snapshot else 'VERIFIED_SOURCE_COUNT' if count else 'UNKNOWN',
+           'blockers':blockers,'warnings':warnings,'can_start':True,
            'scope_signature':scope_fingerprint(mode,q,scope),
            'created_at':clock(),'expires_after_seconds':PREFLIGHT_TTL}
         PREP[token]={'ts':time.monotonic(),'mode':mode,'q':live_q,'scope':scope,'selected':selected,
@@ -603,6 +743,31 @@ async def compare_photo_sets(rt,client,source_urls,candidate_urls,source_key,can
     return None,not bool(diag['failed_pairs']),diag
 
 
+async def _runtime_price_search(rt, q:SearchQuery, role:str):
+    """Use the identical verified first-empty/price-partition engine in ID modes.
+
+    It runs via the job runtime for throttling, cancellation and progress,
+    never treats HTTP 500 as an empty page, and does not change the image
+    matching criteria or source-derived filters.
+    """
+    if role not in ('agent','physical'):
+        raise ValueError('Expected a real listing seller role')
+    if rt.cancelled():raise asyncio.CancelledError()
+    first=await rt.search(replace(q,page=1))
+    scope=Scope('all',1,None,'all',None)
+
+    async def fetch(query):
+        if rt.cancelled():raise asyncio.CancelledError()
+        return await rt.search(query)
+
+    async def flat(query,batch,current_scope):
+        if role=='agent':
+            return await _enumerate_agent_ids_flat(query,batch,current_scope,fetch=fetch)
+        return await _enumerate_owner_ids_flat(query,batch,current_scope,fetch=fetch)
+
+    return await _enumerate_price_partitioned(replace(q,page=1),first,scope,flat,fetch=fetch)
+
+
 class JobRuntime:
     def __init__(self,state):
         self.s=state;self.cache={};self.image_cache={};self.detail_cache={};self.owner_cache={};self.last_request=0;self.error_codes={};self.match_circuit_open=False;self.sift_cache=OrderedDict()
@@ -666,7 +831,7 @@ class JobRuntime:
         """One owner-only MyHome search, exact city/district/rooms/bedrooms.
 
         At price <= $900: [-50,+100]; above $900: [-100,+200].
-        Area range [-10,+5] m2. Two SSR-validated empty pages end the
+        Area range [-10,+5] m2. The first SSR-validated empty page ends the
         search; source problems are recorded as INCOMPLETE, never NOT_FOUND.
         """
         price=agent.get('price_usd')
@@ -691,56 +856,37 @@ class JobRuntime:
             statuses=None,currency_id=2,
             price_from=max(0,math.floor(price+p_lo)),price_to=math.ceil(price+p_hi),
             area_from=max(0,math.floor(area-10)),area_to=math.ceil(area+5))
-        found={};visited=0;end_evidence=None;empty_streak=0
-        seen_source_pages=set();fully_scanned=True;page=1
-        while True:
-            if self.cancelled():raise asyncio.CancelledError()
-            query=replace(probe,page=page)
-            key=json.dumps(query.as_dict(),sort_keys=True)
-            if key not in self.owner_cache:
-                self.s['metrics']['owner_search_calls']+=1
-                try:self.owner_cache[key]=await self.search(query)
-                except SourceError as e:
-                    fully_scanned=False;end_evidence='UPSTREAM_ERROR:'+e.code
-                    break
-            items=self.owner_cache[key]
-            self.s['metrics']['owner_pages_visited']+=1;visited+=1
-            raw=getattr(items,'raw_count',len(items))
-            source_ids=tuple(getattr(items,'raw_ids',None) or (x['listing_id'] for x in items))
-            if raw and not source_ids:
-                fully_scanned=False;end_evidence='RAW_PAGE_IDS_UNAVAILABLE';break
-            if raw and source_ids in seen_source_pages:
-                fully_scanned=False;end_evidence='REPEATED_SOURCE_PAGE_NOT_END';break
-            if raw:
-                seen_source_pages.add(source_ids)
-                self.s['metrics']['owner_listing_pages']=self.s['metrics'].get('owner_listing_pages',0)+1
-            for owner in items:
-                if owner.get('owner_type')!='physical' or owner['listing_id']==agent['listing_id']:
-                    continue
-                self.s['metrics']['owner_candidates_examined']+=1
-                # Do not trust filter echo alone: require exact per-card geography
-                # and room/bedroom IDs. Missing fields do not count as equality.
-                if any(owner.get(k)!=v for k,v in (
-                    ('city_id',int(city)),('district_id',int(district)),
-                    ('rooms',int(rooms)),('bedrooms',int(bedrooms)))):
-                    continue
-                found.setdefault(owner['listing_id'],owner)
-            evidence=getattr(items,'source_count',None)
-            if evidence and page>=evidence['last_page']:
-                end_evidence='VERIFIED_LAST_PAGE';break
-            if raw==0:
-                empty_streak+=1
-                if empty_streak>=2:
-                    end_evidence='TWO_EMPTY_SSR_PAGES';break
-            else:empty_streak=0
-            page+=1
+        try:
+            snapshot=await _runtime_price_search(self,probe,'physical')
+        except SourceError as exc:
+            # Do not turn access denial, schema failure or unverified matching
+            # into a negative match. The calling code marks it INCOMPLETE.
+            return [],False,[{'search':1,'query':probe.upstream_params(),
+                'pages_visited':0,'end_evidence':'UPSTREAM_ERROR:'+exc.code,
+                'coverage_complete':False,'candidate_count':0}]
+        self.s['metrics']['owner_search_calls']+=snapshot['pages_visited']
+        self.s['metrics']['owner_pages_visited']+=snapshot['pages_visited']
+        self.s['metrics']['owner_listing_pages']=self.s['metrics'].get('owner_listing_pages',0)+snapshot['listing_pages']
+        found={}
+        for owner in snapshot['rows']:
+            if owner.get('owner_type')!='physical' or owner['listing_id']==agent['listing_id']:
+                continue
+            self.s['metrics']['owner_candidates_examined']+=1
+            if any(owner.get(k)!=v for k,v in (
+                ('city_id',int(city)),('district_id',int(district)),
+                ('rooms',int(rooms)),('bedrooms',int(bedrooms)))):
+                continue
+            found.setdefault(owner['listing_id'],owner)
         choices=list(found.values())
         self.s['metrics']['owner_candidate_shortlisted']+=len(choices)
         trace=[{'search':1,'query':probe.upstream_params(),
-            'pages_visited':visited,'end_evidence':end_evidence,
-            'coverage_complete':bool(fully_scanned and end_evidence in ('VERIFIED_LAST_PAGE','TWO_EMPTY_SSR_PAGES')),
-            'candidate_count':len(choices)}]
-        return choices,fully_scanned and bool(trace[0]['coverage_complete']),trace
+            'pages_visited':snapshot['pages_visited'],
+            'end_evidence':snapshot['end_reason'],
+            'coverage_complete':snapshot['complete'],
+            'candidate_count':len(choices),
+            'partition_count':snapshot.get('partition_count',1),
+            'failed_page':snapshot.get('failed_page')}]
+        return choices,snapshot['complete'],trace
 
 
     async def match(self,row,q):
@@ -838,6 +984,12 @@ async def run_agent_snapshot(state,q,snapshot):
     """Process the frozen verified agent-ID set, not mutable pages twice."""
     runtime=JobRuntime(state)
     state['status']='RUNNING';progress(state,'agent_snapshot_matching')
+    state['metrics']['pages_visited']=snapshot['pages_visited']
+    state['metrics']['listing_pages']=snapshot['listing_pages']
+    state['metrics']['source_examined']=snapshot['raw_rows']
+    state['metrics']['source_eligible']=snapshot['total']
+    state['metrics']['source_excluded']=snapshot['excluded_rows']
+    state['source_end_evidence']=snapshot['end_reason']
     stop_reason=None
     try:
         for hit in snapshot['rows']:
@@ -862,10 +1014,17 @@ async def run_agent_snapshot(state,q,snapshot):
             save_row(state['job_id'],row)
             progress(state,'agent_matching',last_listing_id=ident)
         if state['status']=='RUNNING':
-            stop_reason='AGENT_SNAPSHOT_EXHAUSTED'
-            if state['metrics']['agent_incomplete']:
+            if not snapshot.get('complete',True):
+                stop_reason='UPSTREAM_HTTP_500_UNVERIFIED_END'
+                state['status']='PARTIAL'
+                state['match_coverage']='SOURCE_ENUMERATION_INCOMPLETE'
+                state['error']=(f"MyHome returned HTTP 500 on page {snapshot['failed_page']}. "
+                                'Processed verified earlier pages only; full coverage unknown.')
+            elif state['metrics']['agent_incomplete']:
+                stop_reason='AGENT_SNAPSHOT_EXHAUSTED'
                 state['status']='PARTIAL';state['match_coverage']='INCOMPLETE'
             else:
+                stop_reason='AGENT_SNAPSHOT_EXHAUSTED'
                 state['status']='COMPLETED';state['match_coverage']='MATCH_FOUND_OR_SINGLE_SEARCH_EXHAUSTED'
     except asyncio.CancelledError:
         state['status']='INTERRUPTED';state['error']='Operation interrupted; results saved'
@@ -906,9 +1065,17 @@ async def run_owner_snapshot(state,snapshot):
             # Permit UI polling / cancellation during larger snapshot writes.
             await asyncio.sleep(0.025)
         if state['status']=='RUNNING':
-            state['status']='COMPLETED';state['stop_reason']='OWNER_SNAPSHOT_EXHAUSTED'
-            state['scope_total_actual']=state['metrics']['rows_collected']
-            state['scope_total_provenance']='COMPLETED_OWNER_SNAPSHOT_WRITE'
+            if not snapshot.get('complete',True):
+                state['status']='PARTIAL'
+                state['stop_reason']='UPSTREAM_HTTP_500_UNVERIFIED_END'
+                state['scope_total_actual']=None
+                state['scope_total_provenance']='PARTIAL_OWNER_SNAPSHOT'
+                state['error']=(f"MyHome returned HTTP 500 on page {snapshot['failed_page']}. "
+                                'Saved verified owner listings; full coverage unknown.')
+            else:
+                state['status']='COMPLETED';state['stop_reason']='OWNER_SNAPSHOT_EXHAUSTED'
+                state['scope_total_actual']=state['metrics']['rows_collected']
+                state['scope_total_provenance']='COMPLETED_OWNER_SNAPSHOT_WRITE'
     except asyncio.CancelledError:
         state['status']='INTERRUPTED';state['error']='Operation interrupted; saved rows remain';state['stop_reason']='INTERRUPTED'
     except Exception as e:
@@ -940,13 +1107,10 @@ async def run_job(state,q):
             state['metrics']['source_examined']+=source_count
             state['metrics']['source_eligible']+=len(items)
             if source_count==0:
-                empty_streak+=1
-                if empty_streak>=2:
-                    stop_reason='SOURCE_END'
-                    state['source_end_evidence']='TWO_EMPTY_SSR_PAGES'
-                    break
-                page+=1
-                continue
+                empty_streak=1
+                stop_reason='SOURCE_END'
+                state['source_end_evidence']='FIRST_EMPTY_SSR_PAGE'
+                break
             empty_streak=0
             state['metrics']['listing_pages']+=1
             raw_ids=tuple(getattr(items,'raw_ids',None) or [r['listing_id'] for r in items])
@@ -1135,36 +1299,30 @@ async def reverse_agents_for_owner(rt, owner, q, offsets=None, *, mixed=False):
         urbans=None,statuses=None)
     if query.price_to<query.price_from or query.area_to<query.area_from:
         raise SourceError('INVALID_MATCH_RANGE','Range is outside allowed values')
-    rows={};fingerprints=set();page=1;empties=0;nonempty=0
-    while True:
-        if rt.cancelled():raise asyncio.CancelledError()
-        rt.s['metrics']['owner_search_calls']+=1
-        batch=await rt.search(replace(query,page=page))
-        if not mixed and getattr(batch,'seller_role_mismatches',0):
-            # Re-run using mixed results; never label a mixed response agent-only.
+    try:
+        snapshot=await _runtime_price_search(rt,query,'agent')
+    except SourceError as exc:
+        if not mixed and exc.code=='AGENT_FILTER_NOT_EFFECTIVE':
+            # Some SSR pages ignore owner_type. Verify each agent locally in
+            # mixed-mode results rather than trusting the upstream role flag.
             return await reverse_agents_for_owner(rt,owner,q,mixed=True)
-        rt.s['metrics']['owner_pages_visited']+=1
-        raw=getattr(batch,'raw_count',len(batch))
-        ids=tuple(getattr(batch,'raw_ids',None) or [x['listing_id'] for x in batch])
-        if raw and raw!=len(ids):raise SourceError('RAW_PAGE_IDS_UNAVAILABLE','Could not verify the full ID set')
-        if raw and ids in fingerprints:raise SourceError('REPEATED_SOURCE_PAGE','Results repeat an earlier page')
-        if raw:
-            fingerprints.add(ids);nonempty+=1;empties=0
-            rt.s['metrics']['owner_listing_pages']=rt.s['metrics'].get('owner_listing_pages',0)+1
-        else:empties+=1
-        candidates=getattr(batch,'agent_role_rows',None)
-        if candidates is None:candidates=batch
-        for hit in candidates:
-            if hit.get('owner_type')!='agent':continue
-            if any(hit.get(k)!=value for k,value in (('city_id',int(city)),('district_id',int(district)),('rooms',int(rooms)),('bedrooms',int(bedrooms)))):continue
-            # SSR search must obey desired price/area ranges, but tolerate its
-            # own per-card rounding; warn for discrepancies rather than invent matches.
-            if hit['listing_id']!=owner['listing_id']:
-                rows.setdefault(hit['listing_id'],hit)
-        if empties==2:break
-        page+=1
-    rt.s['metrics']['listing_pages']=nonempty
-    rt.s['metrics']['pages_visited']=page
+        raise
+    rt.s['metrics']['owner_search_calls']+=snapshot['pages_visited']
+    rt.s['metrics']['owner_pages_visited']+=snapshot['pages_visited']
+    rt.s['metrics']['owner_listing_pages']=rt.s['metrics'].get('owner_listing_pages',0)+snapshot['listing_pages']
+    rows={}
+    for hit in snapshot['rows']:
+        if hit.get('owner_type')!='agent':continue
+        if any(hit.get(k)!=value for k,value in (
+            ('city_id',int(city)),('district_id',int(district)),
+            ('rooms',int(rooms)),('bedrooms',int(bedrooms)))):continue
+        if hit['listing_id']!=owner['listing_id']:
+            rows.setdefault(hit['listing_id'],hit)
+    rt.s['metrics']['listing_pages']=snapshot['listing_pages']
+    rt.s['metrics']['pages_visited']=snapshot['pages_visited']
+    rt.s['single_candidate_coverage_complete']=snapshot['complete']
+    rt.s['single_candidate_end_evidence']=snapshot['end_reason']
+    rt.s['single_candidate_partition_count']=snapshot.get('partition_count',1)
     return list(rows.values())
 
 
@@ -1262,8 +1420,13 @@ async def run_single_job(state,ident,direction,offsets):
                 save_row(state['job_id'],row)
                 state['metrics']['listings_processed']+=1
                 progress(state,'photo_comparison',last_listing_id=hit['listing_id'])
-        if state['metrics']['agent_incomplete']:
+        if state['metrics']['agent_incomplete'] or (
+                direction=='OWNER_TO_AGENTS' and
+                not state.get('single_candidate_coverage_complete',True)):
             state['status']='PARTIAL'
+            if direction=='OWNER_TO_AGENTS' and not state.get('single_candidate_coverage_complete',True):
+                state['error']='Candidate search coverage remains unverified; verified matches are retained'
+                state['scope_total_expected']=None
         else:state['status']='COMPLETED'
     except asyncio.CancelledError:
         state['status']='CANCELLED';state['error']='Stopped by user'

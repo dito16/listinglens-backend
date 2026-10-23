@@ -1,5 +1,6 @@
 """One bounded on-demand MyHome HTML request, with no caches or secrets."""
 from urllib.parse import urlsplit, urljoin
+import asyncio
 import re
 from .parser import SourceError
 
@@ -66,6 +67,7 @@ async def fetch_html(url: str, timeout: int = 15):
         # No retries for refused access, timeouts, or different listing IDs.
         current_url = url
         redirects = 0
+        search_http500_retries = 0
         async with AsyncSession(impersonate="chrome124", trust_env=False) as session:
             while True:
                 resp = await session.get(current_url, headers=REQUEST_HEADERS,
@@ -81,6 +83,14 @@ async def fetch_html(url: str, timeout: int = 15):
                         raise SourceError("UPSTREAM_REDIRECT_LIMIT", "Too many MyHome redirects")
                     redirects += 1
                     current_url = candidate
+                    continue
+                # Only a transient HTTP 500 on a read-only SEARCH URL gets one
+                # bounded second attempt. Do not retry detail-ID requests, access
+                # denials (401/403/429), redirects, other statuses or parse errors.
+                # The user-selected URL and filters remain unchanged.
+                if status == 500 and _path_detail_id(urlsplit(url).path) is None and search_http500_retries == 0:
+                    search_http500_retries = 1
+                    await asyncio.sleep(1.0)
                     continue
                 if status != 200:
                     raise SourceError("UPSTREAM_HTTP_ERROR", f"MyHome returned HTTP {status}", 502)
